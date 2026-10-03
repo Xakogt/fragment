@@ -1,0 +1,14 @@
+{
+  "name": "fragment-lol-panel",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "bot": "node bot.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "dotenv": "^16.4.7",
+    "discord.js": "^14.22.1"
+  }
+}

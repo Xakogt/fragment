@@ -1,0 +1,17 @@
+{
+  "orders": [
+    {
+      "id": "1790982665474-gb5e75",
+      "userId": "1553755989923070217",
+      "username": "253042",
+      "product": "gui",
+      "price": 15,
+      "ticketChannelId": "1555718798177476610",
+      "status": "awaiting_review",
+      "createdAt": "2026-10-02T23:11:05.474Z",
+      "submittedAt": "2026-10-02T23:12:10.083Z",
+      "note": "azczxcz",
+      "giftCardCode": "zxczxczx"
+    }
+  ]
+}

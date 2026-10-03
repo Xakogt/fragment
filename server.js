@@ -1,0 +1,382 @@
+require("dotenv").config();
+const express = require("express");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+app.use(express.json({limit:"2mb"}));
+app.use(express.urlencoded({extended:true}));
+
+const DATA = path.join(__dirname,"data");
+const read = f => JSON.parse(fs.readFileSync(path.join(DATA,f),"utf8"));
+const write = (f,v) => fs.writeFileSync(path.join(DATA,f),JSON.stringify(v,null,2));
+const sha = s => crypto.createHash("sha256").update(String(s)).digest("hex");
+const adminUser = String(process.env.ADMIN_USERNAME || "xako").trim();
+const adminPass = String(process.env.ADMIN_PASSWORD || "Miseryisgoated");
+const internalSecret = String(process.env.INTERNAL_API_SECRET || "change-me-internal-secret");
+const secret = process.env.SESSION_SECRET || "dev-secret-change-me";
+const sessions = new Map();
+const authTokens = new Map();
+const SECURITY_FILE = path.join(DATA,"security.json");
+function readSecurity(){ try{return JSON.parse(fs.readFileSync(SECURITY_FILE,"utf8"));}catch{return {records:[]};} }
+function writeSecurity(v){ fs.writeFileSync(SECURITY_FILE,JSON.stringify(v,null,2)); }
+function upsertSecurity(fields){
+  const db=readSecurity();
+  const idx=db.records.findIndex(r=>r.key===fields.key);
+  const now=new Date().toISOString();
+  if(idx<0){ db.records.push({createdAt:now,lastSeen:null,username:null,discordId:null,product:null,key:null,ip:null,hwid:null,userAgent:null,status:"unknown",...fields}); }
+  else { db.records[idx]={...db.records[idx],...fields,lastSeen:fields.lastSeen||db.records[idx].lastSeen}; }
+  writeSecurity(db);
+}
+
+function ip(req){ return (req.headers["x-forwarded-for"]||req.socket.remoteAddress||"unknown").split(",")[0].trim(); }
+function keyFor(prefix){
+  const chars="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let out="";
+  for(let i=0;i<7;i++) out += chars[crypto.randomInt(chars.length)];
+  return `${prefix}-${out.slice(0,4)}-${out.slice(4)}`;
+}
+function session(req){ const id=req.headers["x-session"]; return id && sessions.get(id); }
+function admin(req,res,next){ const s=session(req); if(!s || !s.admin) return res.status(401).json({error:"Admin sign-in required"}); req.admin=s; next(); }
+function user(req,res,next){ const s=session(req); if(!s || !s.username) return res.status(401).json({error:"Sign in required"}); req.user=s; next(); }
+
+async function discord(event, extra={}){
+  const url=process.env.DISCORD_WEBHOOK_URL;
+  if(!url) return;
+  try{
+    const fields=[
+      {name:"Username",value:String(extra.username||"unknown"),inline:true},
+      {name:"Product",value:String(extra.product||"unknown"),inline:true},
+      {name:"Key",value:String(extra.key||"unknown"),inline:false},
+      {name:"IP",value:String(extra.ip||"unknown"),inline:true},
+      {name:"HWID",value:String(extra.hwid||"unknown"),inline:false}
+    ];
+    if(extra.endpoint) fields.push({name:"Endpoint",value:String(extra.endpoint),inline:false});
+    if(extra.reason) fields.push({name:"Reason",value:String(extra.reason),inline:false});
+    if(extra.userAgent) fields.push({name:"User-Agent",value:String(extra.userAgent).slice(0,1000),inline:false});
+    const body={embeds:[{title:"Fragment Security Alert",description:`**${event}**`,fields}]};
+    await fetch(url,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+  }catch{}
+}
+
+function findKey(k){ return read("keys.json").keys.find(x=>x.key===k); }
+function findUser(u){ return read("users.json").users.find(x=>x.username.toLowerCase()===String(u).toLowerCase()); }
+
+app.get("/",(_,res)=>res.sendFile(path.join(__dirname,"public/index.html")));
+app.use(express.static(path.join(__dirname,"public")));
+
+app.post("/api/admin/login",(req,res)=>{
+  const {username,password}=req.body;
+  if(String(username||"").trim()!==adminUser || String(password||"")!==adminPass) return res.status(401).json({error:"Invalid admin credentials"});
+  const id=crypto.randomBytes(32).toString("hex"); sessions.set(id,{admin:true,username});
+  res.json({session:id,username,admin:true});
+});
+app.get("/api/admin/me",admin,(req,res)=>res.json({username:req.admin.username,admin:true}));
+
+app.get("/api/admin/keys",admin,(req,res)=>res.json(read("keys.json").keys));
+app.post("/api/admin/keys",admin,(req,res)=>{
+  const type=["gui","table","software"].includes(req.body.type)?req.body.type:"table";
+  const count=Math.min(Math.max(Number(req.body.count)||1,1),500);
+  const db=read("keys.json");
+  const made=[];
+  for(let i=0;i<count;i++){
+    let k; do{k=keyFor(type==="gui"?"FRAGMENTGUI":type==="software"?"FRAGMENTSW":"FRAGMENT")}while(db.keys.some(x=>x.key===k));
+    const item={key:k,type,status:"unused",createdAt:new Date().toISOString(),username:null,hwid:null};
+    db.keys.push(item); made.push(k);
+  }
+  write("keys.json",db); res.json({keys:made});
+});
+app.post("/api/admin/keys/import",admin,(req,res)=>{
+  const type=["gui","table","software"].includes(req.body.type)?req.body.type:"table";
+  const raw=String(req.body.keys||"");
+  const arr=raw.split(/\r?\n|,/).map(x=>x.trim()).filter(Boolean);
+  const db=read("keys.json"), added=[], rejected=[];
+  for(const k of arr){
+    const good=type==="gui" ? /^FRAGMENTGUI-[A-Z0-9]{4}-[A-Z0-9]{3}$/.test(k) : type==="software" ? /^FRAGMENTSW-[A-Z0-9]{4}-[A-Z0-9]{3}$/.test(k) : /^FRAGMENT-[A-Z0-9]{4}-[A-Z0-9]{3}$/.test(k);
+    if(good && !db.keys.some(x=>x.key===k)){db.keys.push({key:k,type,status:"unused",createdAt:new Date().toISOString(),username:null,hwid:null});added.push(k)}
+    else rejected.push(k);
+  }
+  write("keys.json",db); res.json({added,rejected});
+});
+app.post("/api/admin/keys/:key/revoke",admin,(req,res)=>{
+  const db=read("keys.json"), k=db.keys.find(x=>x.key===req.params.key);
+  if(!k) return res.status(404).json({error:"Key not found"}); k.status="revoked"; write("keys.json",db); res.json({ok:true});
+});
+app.post("/api/admin/keys/:key/delete",admin,(req,res)=>{
+  const db=read("keys.json"); db.keys=db.keys.filter(x=>x.key!==req.params.key); write("keys.json",db); res.json({ok:true});
+});
+
+app.post("/api/signup",(req,res)=>{
+  const {username,password,key,hwid}=req.body;
+  if(!username||!password||!key||!hwid) return res.status(400).json({error:"Username, password, key and HWID are required"});
+  if(findUser(username)) return res.status(409).json({error:"Username already exists"});
+  const db=read("keys.json"), lic=db.keys.find(x=>x.key===key);
+  if(!lic || lic.status==="revoked") return res.status(403).json({error:"Invalid or revoked license key"});
+  if(lic.username && lic.username.toLowerCase()!==username.toLowerCase()) return res.status(403).json({error:"This key is already assigned"});
+  if(!["gui","table","software"].includes(lic.type)) return res.status(400).json({error:"Invalid product"});
+  const users=read("users.json");
+  users.users.push({username,passwordHash:sha(password+secret),products:[lic.type],hwids:{[lic.type]:sha(hwid)},createdAt:new Date().toISOString()});
+  lic.status="used"; lic.username=username; lic.hwid=sha(hwid);
+  write("users.json",users); write("keys.json",db);
+  upsertSecurity({key:lic.key,product:lic.type,username,discordId:lic.discordId||null,ip:ip(req),hwid:sha(hwid),status:"active",lastSeen:new Date().toISOString(),userAgent:req.get("user-agent")||null});
+  res.json({ok:true,username,products:[lic.type]});
+});
+app.post("/api/login",(req,res)=>{
+  const {username,password,hwid}=req.body, u=findUser(username);
+  if(!u || u.passwordHash!==sha(String(password)+secret)) return res.status(401).json({error:"Invalid login"});
+  const matched=Object.entries(u.hwids||{}).find(([type,h])=>h===sha(hwid));
+  if(!matched) return res.status(403).json({error:"This device is not authorized for this account"});
+  const id=crypto.randomBytes(32).toString("hex"); sessions.set(id,{username:u.username,products:u.products});
+  for(const [type,h] of Object.entries(u.hwids||{})){
+    const lic=read("keys.json").keys.find(k=>k.username&&k.username.toLowerCase()===u.username.toLowerCase()&&k.type===type&&k.status!=="revoked");
+    if(lic) upsertSecurity({key:lic.key,product:type,username:u.username,discordId:lic.discordId||null,ip:ip(req),hwid:h,status:"active",lastSeen:new Date().toISOString(),userAgent:req.get("user-agent")||null});
+  }
+  res.json({session:id,username:u.username,products:u.products});
+});
+app.post("/api/redeem",user,(req,res)=>{
+  const key=String(req.body.key||"").trim().toUpperCase();
+  const hwid=String(req.body.hwid||"").trim();
+  if(!key || !hwid) return res.status(400).json({error:"Key and HWID are required"});
+
+  const db=read("keys.json");
+  const lic=db.keys.find(x=>String(x.key).toUpperCase()===key);
+  if(!lic || lic.status==="revoked") return res.status(403).json({error:"Invalid or revoked key"});
+  if(!["gui","table","software"].includes(lic.type)) return res.status(400).json({error:"Invalid product key"});
+  if(lic.username && lic.username.toLowerCase()!==req.user.username.toLowerCase()) return res.status(403).json({error:"Key already assigned"});
+
+  // IMPORTANT: update the exact user object inside the array that will be
+  // written back to users.json. The old code mutated a separately-read copy,
+  // so the UI could say "unlocked" while the next API request still saw the
+  // product as locked.
+  const users=read("users.json");
+  const u=users.users.find(x=>x.username.toLowerCase()===req.user.username.toLowerCase());
+  if(!u) return res.status(404).json({error:"Account not found"});
+  u.products=Array.isArray(u.products)?u.products:[];
+  u.hwids=u.hwids||{};
+
+  if(u.products.includes(lic.type)) return res.status(409).json({error:"You already own this product"});
+  if(lic.hwid && lic.hwid!==sha(hwid)) return res.status(403).json({error:"Key is locked to another device"});
+
+  u.products.push(lic.type);
+  u.hwids[lic.type]=sha(hwid);
+  lic.status="used";
+  lic.username=u.username;
+  lic.hwid=sha(hwid);
+
+  write("users.json",users);
+  write("keys.json",db);
+  upsertSecurity({key:lic.key,product:lic.type,username:u.username,discordId:lic.discordId||null,ip:ip(req),hwid:lic.hwid,status:"active",lastSeen:new Date().toISOString(),userAgent:req.get("user-agent")||null});
+
+  // Refresh the in-memory session too, so the newly redeemed product is
+  // immediately available without logging out/in again.
+  for(const [id,s] of sessions.entries()){
+    if(s.username && s.username.toLowerCase()===u.username.toLowerCase() && !s.admin){
+      s.products=[...u.products];
+    }
+  }
+
+  res.json({ok:true,username:u.username,products:[...u.products]});
+});
+app.post("/api/internal/issue-key",(req,res)=>{
+  if(String(req.headers["x-internal-secret"]||"")!==internalSecret) return res.status(401).json({error:"Unauthorized"});
+  const type=String(req.body.type||"").toLowerCase();
+  const username=String(req.body.username||"").trim() || null;
+  const discordId=String(req.body.discordId||"").trim() || null;
+  const orderId=String(req.body.orderId||"").trim() || null;
+  if(!["software","gui","table"].includes(type)) return res.status(400).json({error:"Invalid product type"});
+  const db=read("keys.json");
+  let k; do { k=keyFor(type==="gui"?"FRAGMENTGUI":type==="software"?"FRAGMENTSW":"FRAGMENT"); } while(db.keys.some(x=>x.key===k));
+  const item={key:k,type,status:"unused",createdAt:new Date().toISOString(),username,hwid:null,source:"discord-ticket",discordId,orderId};
+  db.keys.push(item);
+  write("keys.json",db);
+  upsertSecurity({key:k,product:type,discordId,orderId,username,ip:null,hwid:null,status:"issued"});
+  res.json({ok:true,key:k,type});
+});
+
+app.get("/api/profile",user,(req,res)=>{ const u=findUser(req.user.username); res.json({username:u.username,products:u.products,createdAt:u.createdAt}); });
+
+app.get("/api/admin/security",admin,(req,res)=>{
+  const records=readSecurity().records.sort((a,b)=>String(b.lastSeen||b.createdAt||"").localeCompare(String(a.lastSeen||a.createdAt||"")));
+  res.json(records);
+});
+
+app.get("/api/admin/product/:type",admin,(req,res)=>{
+  if(!["gui","table"].includes(req.params.type)) return res.status(400).json({error:"Bad product"});
+  const c=read("config.json"), source=fs.readFileSync(path.join(DATA,req.params.type==="gui"?"gui.lua":"table.lua"),"utf8");
+  res.json({config:c[req.params.type],source});
+});
+app.post("/api/admin/product/:type",admin,(req,res)=>{
+  const t=req.params.type; if(!["gui","table"].includes(t)) return res.status(400).json({error:"Bad product"});
+  const c=read("config.json"); c[t]={...(c[t]||{}),...(req.body.config||{})}; write("config.json",c);
+  if(typeof req.body.source==="string") fs.writeFileSync(path.join(DATA,t==="gui"?"gui.lua":"table.lua"),req.body.source);
+  res.json({ok:true});
+});
+
+function licenseKeyForUser(username,type){
+  const db=read("keys.json");
+  return db.keys.find(k => k.type===type && k.username && k.username.toLowerCase()===String(username).toLowerCase() && k.status!=="revoked")?.key || "";
+}
+
+function publicBaseUrl(req){
+  const configured=String(process.env.PUBLIC_URL||process.env.PUBLIC_BASE_URL||"").trim().replace(/\/$/,"");
+  if(configured) return configured;
+  const proto=String(req.headers["x-forwarded-proto"]||req.protocol||"http").split(",")[0];
+  const host=req.get("host");
+  return `${proto}://${host}`;
+}
+
+function customLoadstring(req,username,type){
+  const key=licenseKeyForUser(username,type);
+  if(!key) return "";
+  const base=publicBaseUrl(req);
+  // The website download contains only this loader. The product source is
+  // served separately by the product-specific endpoint after the key is checked.
+  const endpoint=`${base}/api/v1/${type}/loader?key=${encodeURIComponent(key)}`;
+  return `script_key=${JSON.stringify(key)};\nloadstring(game:HttpGet(${JSON.stringify(endpoint)}))()`;
+}
+
+app.get("/api/product/:type",user,(req,res)=>{
+  const t=req.params.type, u=findUser(req.user.username);
+  if(!["gui","table"].includes(t)||!u.products.includes(t)) return res.status(403).json({error:"Product not unlocked"});
+  const c=read("config.json")[t];
+  res.json({name:c.name,loadstring:customLoadstring(req,u.username,t),configuration:t==="table"?c.configuration:null});
+});
+
+
+app.post("/api/config/save",user,(req,res)=>{
+  const u=findUser(req.user.username);
+  if(!u.products.includes("table")) return res.status(403).json({error:"Table not unlocked"});
+  const configuration=String(req.body.configuration||"");
+  if(configuration.length>200000) return res.status(413).json({error:"Configuration is too large"});
+  u.tableConfig=configuration;
+  const users=read("users.json");
+  const stored=findUser(req.user.username);
+  stored.tableConfig=configuration;
+  write("users.json",users);
+  res.json({ok:true});
+});
+
+function tablePayload(username){
+  const c=read("config.json").table || {};
+  const u=username ? findUser(username) : null;
+  const source=fs.readFileSync(path.join(DATA,"table.lua"),"utf8");
+  // Each account gets its own live configuration. If the user has not saved
+  // one yet, fall back to the admin-defined default in config.json.
+  const cfg=String((u && u.tableConfig != null) ? u.tableConfig : (c.configuration||""));
+  if(source.includes("{{CONFIG}}")) return source.replaceAll("{{CONFIG}}",cfg);
+  return source;
+}
+
+const NOT_AUTHORIZED_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Not Authorized</title>
+  <style>
+    :root{color-scheme:dark}
+    *{box-sizing:border-box}
+    html,body{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    body{min-height:100vh;background:#1a1d2f;color:#f5f7ff;display:grid;place-items:center}
+    .wrap{text-align:center;padding:32px}
+    .title{font-size:20px;font-weight:750;margin-bottom:18px}
+    .title span{color:#ff536b}
+    h1{font-size:22px;line-height:1.3;margin:0 0 14px}
+    p{margin:0;color:#d7d9e4;font-size:15px}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="title"><span>🚫</span> Not Authorized <span>🚫</span></div>
+    <h1>You are not allowed to view these files.</h1>
+    <p>Close this page &amp; proceed.</p>
+  </main>
+</body>
+</html>`;
+
+function notAuthorized(res){
+  return res.status(403).set("Cache-Control","no-store, no-cache, must-revalidate, private").type("html").send(NOT_AUTHORIZED_HTML);
+}
+
+// Explicit source-style URLs never expose product code. They show the same
+// Not Authorized page instead. The actual Lua payload is available only from
+// the product loader endpoint after its license has been validated.
+for (const route of [
+  "/api/v1/gui/source", "/api/v1/gui/source.lua", "/api/v1/table/source",
+  "/api/v1/table/source.lua", "/api/v1/gui/source/", "/api/v1/table/source/",
+  "/gui.lua", "/table.lua"
+]) {
+  app.get(route, (req,res) => {
+    // These routes are intentionally never valid source-delivery endpoints.
+    // Log the attempt server-side and then show the protected-file page.
+    discord("Unauthorized source access attempt", {
+      endpoint:req.originalUrl,
+      reason:"Protected source-style URL requested",
+      ip:ip(req),
+      userAgent:req.get("user-agent") || "unknown"
+    });
+    return notAuthorized(res);
+  });
+}
+
+function loaderLicense(req,res,type){
+  const key=String(req.query.key||"").trim().toUpperCase();
+  const lic=findKey(key);
+  if(!key || !lic || lic.type!==type || lic.status==="revoked") return res.status(403).type("text/plain").send("Product not unlocked");
+  const u=lic.username ? findUser(lic.username) : null;
+  if(!u || !u.products.includes(type) || lic.hwid!==u.hwids?.[type]) return res.status(403).type("text/plain").send("Product not unlocked");
+
+  // A normal browser navigation advertises HTML. Show the protected-file page
+  // rather than rendering the Lua payload in a browser tab. A script request
+  // gets the Lua payload it needs.
+  const accept=String(req.headers.accept||"").toLowerCase();
+  if(accept.includes("text/html") && !accept.includes("application/json")) {
+    // A browser navigation to the live loader would otherwise render the
+    // complete Lua payload. Treat it as a source-view attempt, alert the
+    // owner, and return the protected-file page instead. Normal script
+    // requests do not advertise HTML and are not alerted.
+    discord("Possible source access via loader URL", {
+      username:u.username,
+      product:type,
+      key,
+      ip:ip(req),
+      endpoint:req.originalUrl,
+      reason:"Loader requested as an HTML/browser navigation",
+      userAgent:req.get("user-agent") || "unknown"
+    });
+    return notAuthorized(res);
+  }
+
+  upsertSecurity({key:lic.key,product:type,username:u.username,discordId:lic.discordId||null,ip:ip(req),hwid:lic.hwid||u.hwids?.[type]||null,status:"active",lastSeen:new Date().toISOString(),userAgent:req.get("user-agent")||null});
+  const source=type==="table" ? tablePayload(u.username) : fs.readFileSync(path.join(DATA,"gui.lua"),"utf8");
+  res.set("Cache-Control","no-store, no-cache, must-revalidate, private");
+  res.set("Content-Disposition","inline");
+  res.type("text/plain").send(source);
+}
+
+// These are the two product-specific live endpoints. They are tied to the
+// license key embedded in the downloaded loadstring, so the same endpoint
+// always serves the current version for that product/key.
+app.get("/api/v1/gui/loader",(req,res)=>loaderLicense(req,res,"gui"));
+app.get("/api/v1/table/loader",(req,res)=>loaderLicense(req,res,"table"));
+app.post("/api/v1/:type/auth",(req,res)=>{
+  const t=req.params.type, {key,hwid}=req.body, lic=findKey(key);
+  if(!["gui","table"].includes(t)||!lic||lic.type!==t||lic.status==="revoked") return res.status(403).json({error:"Invalid license"});
+  const user=lic.username?findUser(lic.username):null;
+  if(!user || !user.products.includes(t)) return res.status(403).json({error:"License not activated"});
+  if(lic.hwid!==sha(hwid)) { discord("HWID mismatch",{username:user.username,product:t,key,ip:ip(req),hwid}); upsertSecurity({key:lic.key,product:t,username:user.username,discordId:lic.discordId||null,ip:ip(req),hwid:sha(hwid),status:"HWID mismatch",lastSeen:new Date().toISOString(),userAgent:req.get("user-agent")||null}); return res.status(403).json({error:"HWID mismatch"}); }
+  upsertSecurity({key:lic.key,product:t,username:user.username,discordId:lic.discordId||null,ip:ip(req),hwid:sha(hwid),status:"active",lastSeen:new Date().toISOString(),userAgent:req.get("user-agent")||null});
+  const token=crypto.randomBytes(32).toString("hex");
+  authTokens.set(token,{type:t,username:user.username,expires:Date.now()+30000,used:false});
+  res.json({token});
+});
+app.post("/api/v1/:type/payload",(req,res)=>{
+  const t=req.params.type, a=authTokens.get(req.body.token);
+  if(!a||a.used||a.type!==t||a.expires<Date.now()) return res.status(403).json({error:"Expired or invalid token"});
+  a.used=true;
+  const source=t==="table" ? tablePayload(a.username) : fs.readFileSync(path.join(DATA,"gui.lua"),"utf8");
+  res.type("text/plain").send(source);
+});
+app.use((_,res)=>res.status(404).json({error:"Not found"}));
+app.listen(process.env.PORT||3000,()=>console.log(`Fragment.lol running on http://localhost:${process.env.PORT||3000}`));

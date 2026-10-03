@@ -1,0 +1,17 @@
+{
+  "software": {
+    "name": "Fragment Software",
+    "prefix": "FRAGMENTSW",
+    "price": 12
+  },
+  "gui": {
+    "name": "Fragment GUI",
+    "prefix": "FRAGMENTGUI",
+    "price": 15
+  },
+  "table": {
+    "name": "Fragment Table",
+    "prefix": "FRAGMENT",
+    "price": 25
+  }
+}

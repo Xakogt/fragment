@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>fragment.lol</title><link rel="stylesheet" href="/style.css"></head>
+<body><div class="shell"><header><div class="brand"><img src="/icon.png" onerror="this.style.display='none'"><span>fragment<span>.lol</span></span></div><div id="who"></div></header>
+<main>
+<section id="gate" class="card">
+  <div class="tabs"><button class="active" data-mode="login">Sign in</button><button data-mode="signup">Create account</button><button data-mode="admin">Admin</button></div>
+  <div id="authmsg"></div>
+  <div id="loginbox"><input id="lu" placeholder="Username"><input id="lp" type="password" placeholder="Password"><input id="lh" placeholder="Device ID (use the same browser)"><button id="login">Sign in</button></div>
+  <div id="signupbox" class="hidden"><input id="su" placeholder="Username"><input id="sp" type="password" placeholder="Password"><input id="sk" placeholder="License key"><input id="sh" placeholder="Device ID"><button id="signup">Create account</button></div><div id="adminbox" class="hidden"><input id="au" placeholder="Admin username"><input id="ap" type="password" placeholder="Admin password"><button id="adminlogin">Sign in as admin</button></div>
+</section>
+<section id="app" class="hidden">
+<nav><button data-p="dashboard">Dashboard</button><button data-p="profile">Profile / Redeem</button><button id="adminnav" data-p="admin">Admin</button><button id="securitynav" class="hidden" data-p="security">Security</button><button id="logout">Log out</button></nav>
+<div id="view"></div>
+</section>
+</main></div><script src="/app.js"></script></body></html>

@@ -1,0 +1,11 @@
+{
+  "gui": {
+    "name": "Fragment GUI",
+    "loadstring": ""
+  },
+  "table": {
+    "name": "Fragment Table",
+    "loadstring": "",
+    "configuration": "-- Fragment Table configuration\nreturn {}"
+  }
+}
